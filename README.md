@@ -1,0 +1,133 @@
+# teamsexport
+
+Pull your Microsoft Teams chat history out of the local client cache and render it
+as readable HTML. No tenant admin, no eDiscovery, no Graph app registration, no
+waiting for someone to approve a compliance export.
+
+Teams already has your messages on disk — it keeps whatever it has synced in a
+Chromium IndexedDB (LevelDB) store inside its app data folder. This just reads
+that and prints it nicely.
+
+```
+python teamsexport.py collect                 # on the Teams machine -> snapshot zip
+python teamsexport.py extract snap.zip        # -> messages.jsonl (merges into existing)
+python teamsexport.py render                  # -> teams-export.html
+python teamsexport.py watch --interval 900    # all three, on a loop
+```
+
+## Why the two-step split
+
+`collect` is **stdlib-only** — it copies the LevelDB files into a zip and nothing
+else. That's the only part that has to run on the locked-down corporate box with
+Teams on it. Parsing and rendering happen wherever you like, off a zip you carry
+around.
+
+## The eviction problem
+
+Teams is a cache, not an archive. It holds recent messages plus whatever you've
+scrolled back through, and it evicts. So:
+
+- **Scroll back** in a conversation you care about before collecting — that pulls
+  older messages down into the local store.
+- `extract` **merges** into `messages.jsonl` and dedupes, so repeated snapshots
+  accumulate history rather than replacing it. Once a message is in your jsonl it
+  stays, even after Teams drops it.
+- `watch` automates that: snapshot → merge → re-render on an interval. Leave it
+  running and your export only ever grows.
+
+## Install
+
+`collect` needs nothing but Python 3.11+.
+
+`extract` needs a LevelDB/IndexedDB reader:
+
+```
+pip install -r requirements.txt
+```
+
+That pulls [`ccl_chromium_reader`](https://github.com/cclgroupltd/ccl_chromium_reader)
+from GitHub (pure Python — no compiler, no `python-snappy` build). Google's
+`dfindexeddb` does the same job but drags in `python-snappy`, which needs a C
+toolchain on Windows, so it's out.
+
+## Where it looks
+
+Microsoft has moved this path twice, and the WebView2 profile directory varies,
+so discovery is glob-based rather than hardcoded:
+
+| Client | Path |
+|---|---|
+| New Teams (2.x) | `%LOCALAPPDATA%\Packages\MSTeams_*\LocalCache\Microsoft\MSTeams\EBWebView\*\IndexedDB\*.leveldb` |
+| Teams 2.x preview | `%LOCALAPPDATA%\Packages\MicrosoftTeams_*\...` |
+| Classic Teams (1.x) | `%APPDATA%\Microsoft\Teams\IndexedDB\*.leveldb` |
+
+Fallback: recursive search under `%LOCALAPPDATA%\Packages\*Teams*` for anything
+named `*.indexeddb.leveldb`. If Microsoft renames it again, that catches it.
+
+Sibling `.blob` directories (large message values that don't fit inline) are
+collected too.
+
+**Running Teams holds some files open.** `collect` skips what it can't read and
+records them in the zip's `manifest.json`. You get a more complete snapshot with
+Teams closed, but it works either way — the `.ldb` files, which hold the bulk of
+the history, are readable while it runs.
+
+## Parsing approach
+
+Every published parser for this breaks whenever Microsoft changes the object
+store layout or the wrapper keys. So this one doesn't hardcode store names: it
+walks *every* record in *every* object store and duck-types anything that looks
+like a message (has `content`/`body` plus a message type or a timestamp) or a
+conversation (has an id and a display name). Field lookups are
+case-insensitive, because Teams mixes `composetime` and `composeTime` in the
+same database.
+
+That's deliberately loose. It picks up drafts and system events alongside real
+messages; the HTML greys out `ThreadActivity/*` system noise rather than hiding
+it.
+
+## The HTML
+
+Single self-contained file. Conversation sidebar, live filter across senders and
+message bodies with match highlighting, light/dark from your OS setting, no
+external requests.
+
+Message bodies are arbitrary HTML written by other people, so they go through an
+allowlist sanitizer (stdlib `HTMLParser`): known-safe tags only, `href` limited to
+http/https/mailto, `<script>`/`<style>` contents dropped, unclosed tags balanced.
+Teams-specific tags are handled — `<emoji alt="😀">` becomes the emoji, `<at>`
+becomes a styled mention, images become an `[image]` placeholder (they're
+auth-gated URLs that won't load outside Teams anyway).
+
+## Status
+
+| | |
+|---|---|
+| `collect` | written, exits cleanly when no Teams is present; **not yet run against a real Teams install** |
+| `extract` | written; **untested against a real Teams LevelDB** — this is the part most likely to need tweaking |
+| `render` | working, verified end to end on synthetic data |
+| `watch` | written, untested |
+| `selftest` | `python teamsexport.py selftest` — asserts on the sanitizer, the duck-typed record walker, and timestamp parsing |
+
+Next thing to do is run `collect` + `extract` on a machine that actually has
+Teams and see what the object stores really look like. Expect the duck-typing
+heuristics in `looks_like_message` / `looks_like_conversation` to need
+adjustment, and the conversation-name map to be incomplete.
+
+## Not doing
+
+- **Graph API export.** Needs an app registration and, in most tenants, admin
+  consent — which is the thing this exists to avoid.
+- **Attachments.** Links are preserved; the files themselves live in SharePoint
+  and OneDrive behind auth.
+- **Decrypting anything.** This reads files your own user account can already
+  read. It's your data, on your disk.
+
+## Prior art
+
+The forensics community got here first, and the paths and general approach come
+from their work:
+
+- [lxndrblz/forensicsim](https://github.com/lxndrblz/forensicsim) — Autopsy module for Teams IndexedDB
+- [forensics.im](https://forensics.im/blog/parsing-microsoft-teams-indexeddb/) — write-up on Teams 1.x/2.x IndexedDB
+- [cclgroupltd/ccl_chromium_reader](https://github.com/cclgroupltd/ccl_chromium_reader) — the LevelDB/IndexedDB/V8 reader doing the heavy lifting here

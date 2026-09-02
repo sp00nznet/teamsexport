@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+snapshots/
+*.zip
+messages.jsonl
+messages.convs.json
+teams-export.html
