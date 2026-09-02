@@ -15,6 +15,30 @@ python teamsexport.py render                  # -> teams-export.html
 python teamsexport.py watch --interval 900    # all three, on a loop
 ```
 
+## Windows executables
+
+`build.cmd` produces two standalone exes in `dist\` — no Python, no pip, nothing
+to install on the target machine:
+
+| | |
+|---|---|
+| `teamsexport.exe` | console; same four subcommands as above |
+| `teamsexport-gui.exe` | windowed; **Export now**, **Parse a snapshot zip...**, **Open export**, and a **watch** toggle with an interval, over a log pane |
+
+The GUI defaults to `%USERPROFILE%\TeamsExport` for its snapshots, `messages.jsonl`
+and `teams-export.html`; change it in the box at the top. Everything runs on a
+worker thread, so the window stays responsive, and a lock keeps a manual run and a
+watch tick from stomping on the same jsonl.
+
+Both bundle the LevelDB reader, so `extract` works on a machine that has never
+seen pip. They're unsigned PyInstaller one-file builds (~10 MB / ~13 MB), so
+SmartScreen will warn on first run and picky corporate AV may object — that's the
+usual cost of an unsigned exe, not a sign of anything.
+
+The build runs in a local `.venv` on purpose: PyInstaller refuses to run when the
+obsolete `pathlib` PyPI backport is installed globally, which it is on plenty of
+machines.
+
 ## Why the two-step split
 
 `collect` is **stdlib-only** — it copies the LevelDB files into a zip and nothing
@@ -35,7 +59,9 @@ scrolled back through, and it evicts. So:
 - `watch` automates that: snapshot → merge → re-render on an interval. Leave it
   running and your export only ever grows.
 
-## Install
+## Install (from source)
+
+Not needed if you're using the exes above.
 
 `collect` needs nothing but Python 3.11+.
 
@@ -104,10 +130,12 @@ auth-gated URLs that won't load outside Teams anyway).
 | | |
 |---|---|
 | `collect` | written, exits cleanly when no Teams is present; **not yet run against a real Teams install** |
-| `extract` | written; **untested against a real Teams LevelDB** — this is the part most likely to need tweaking |
+| `extract` | written; survives a corrupt/partial LevelDB without aborting (a snapshot of a *running* Teams always is one). **Untested against a real Teams LevelDB** — the part most likely to need tweaking |
 | `render` | working, verified end to end on synthetic data |
 | `watch` | written, untested |
-| `selftest` | `python teamsexport.py selftest` — asserts on the sanitizer, the duck-typed record walker, and timestamp parsing |
+| GUI | builds and launches; buttons wired to the same functions the CLI uses |
+| exes | both build clean and run — `teamsexport.exe selftest` passes, GUI window renders |
+| `selftest` | `python teamsexport.py selftest` (or `teamsexport.exe selftest`) — asserts on the sanitizer, the duck-typed record walker, timestamp parsing, and that `extract` degrades gracefully on a garbage database |
 
 Next thing to do is run `collect` + `extract` on a machine that actually has
 Teams and see what the object stores really look like. Expect the duck-typing

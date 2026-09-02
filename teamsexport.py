@@ -174,20 +174,28 @@ def conv_name(c: dict) -> str:
 def iter_records(db_dir: pathlib.Path):
     from ccl_chromium_reader import ccl_chromium_indexeddb as ix
     blob = db_dir.with_name(db_dir.name.replace(".leveldb", ".blob"))
-    wrapped = ix.WrappedIndexDB(db_dir, blob if blob.is_dir() else None)
-    for db_id in wrapped.database_ids:
+    # A snapshot taken while Teams is running is partial by definition -- locked
+    # files, half-written tables. Never let one bad table abort the whole export.
+    try:
+        wrapped = ix.WrappedIndexDB(db_dir, blob if blob.is_dir() else None)
+        db_ids = list(wrapped.database_ids)
+    except Exception as e:
+        print(f"  ! cannot open {db_dir}: {e!r}", file=sys.stderr)
+        return
+    for db_id in db_ids:
         try:
             db = wrapped[db_id.dbid_no]
+            stores = list(db.object_store_names)
         except Exception as e:
-            print(f"  ! db {db_id}: {e}", file=sys.stderr)
+            print(f"  ! db {db_id}: {e!r}", file=sys.stderr)
             continue
-        for store_name in db.object_store_names:
+        for store_name in stores:
             try:
                 store = db[store_name]
                 for rec in store.iterate_records(bad_deserializer_data_handler=lambda k, v: None):
                     yield rec.value
             except Exception as e:
-                print(f"  ! {db_id.name}/{store_name}: {e}", file=sys.stderr)
+                print(f"  ! {db_id.name}/{store_name}: {e!r}", file=sys.stderr)
 
 
 def load_store(path: pathlib.Path) -> dict:
@@ -422,16 +430,20 @@ def cmd_render(args) -> pathlib.Path:
 
 # ---------------------------------------------------------------- watch
 
+def export_once(snapshots, store, out) -> None:
+    """collect -> merge -> render. The whole job, one call. Shared with the GUI."""
+    snaps = pathlib.Path(snapshots)
+    snaps.mkdir(parents=True, exist_ok=True)
+    z = cmd_collect(argparse.Namespace(out=str(snaps / f"snap-{dt.datetime.now():%Y%m%d-%H%M%S}.zip")))
+    cmd_extract(argparse.Namespace(source=str(z), out=store))
+    cmd_render(argparse.Namespace(source=store, out=out))
+
+
 def cmd_watch(args) -> None:
     """Teams evicts old cache; snapshotting on a loop is how you keep history."""
-    snaps = pathlib.Path(args.snapshots)
-    snaps.mkdir(parents=True, exist_ok=True)
     while True:
-        stamp = f"{dt.datetime.now():%Y%m%d-%H%M%S}"
         try:
-            z = cmd_collect(argparse.Namespace(out=str(snaps / f"snap-{stamp}.zip")))
-            cmd_extract(argparse.Namespace(source=str(z), out=args.store))
-            cmd_render(argparse.Namespace(source=args.store, out=args.out))
+            export_once(args.snapshots, args.store, args.out)
         except SystemExit as e:
             print(f"skip: {e}", file=sys.stderr)
         except Exception as e:
@@ -471,6 +483,18 @@ def cmd_selftest(_args) -> None:
     assert c2 == [conv] and conv_name(conv) == "PM guild"
     assert conv_name({"id": "1", "type": "Chat", "title": "",
                       "members": [{"displayName": "Bo"}, {"displayName": "Cy"}]}) == "Bo, Cy"
+
+    # a snapshot of a running Teams is always partial -- extract must survive it
+    try:
+        import ccl_chromium_reader  # noqa: F401
+    except ImportError:
+        print("ok (extract not checked: pip install -r requirements.txt)")
+        return
+    d = pathlib.Path(tempfile.mkdtemp(prefix="teamsexport-test-"))
+    (d / "CURRENT").write_text("MANIFEST-000001")
+    (d / "000005.ldb").write_bytes(b"not a real sstable")
+    cmd_extract(argparse.Namespace(source=str(d), out=str(d / "m.jsonl")))
+    shutil.rmtree(d, ignore_errors=True)
     print("ok")
 
 
