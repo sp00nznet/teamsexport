@@ -105,9 +105,13 @@ def looks_like_message(d: dict) -> bool:
 
 
 def looks_like_conversation(d: dict) -> bool:
-    k = keys(d)
-    return "id" in k and bool(k & {"displayname", "title", "topic"}) and bool(
-        k & {"threadproperties", "lastmessage", "members", "type"})
+    # Teams ids are prefixed (19: threads and meetings, 48: drafts/mentions/etc),
+    # which is a tighter gate than any of the name fields -- the channel title is
+    # often nested in threadProperties rather than sitting at the top level.
+    if "id" not in keys(d) or not str(get(d, "id", default="")).startswith(("19:", "48:")):
+        return False
+    return bool(keys(d) & {"displayname", "title", "topic", "threadproperties",
+                           "members", "lastmessage", "type"})
 
 
 def walk(obj, out_msgs: list, out_convs: list, depth: int = 0) -> None:
@@ -172,12 +176,15 @@ def normalize(m: dict) -> dict | None:
 
 
 def conv_name(c: dict) -> str:
-    n = get(c, "displayName", "title", "topic")
+    n = get(c, "displayName", "title", "topic", "spaceThreadTopic")
+    if not n:
+        tp = get(c, "threadProperties", default={})
+        n = get(tp, "topic", "spaceThreadTopic", "title") if isinstance(tp, dict) else None
     if not n:
         members = get(c, "members", default=[]) or []
         names = [get(x, "displayName", "imdisplayname") for x in members if isinstance(x, dict)]
         n = ", ".join(x for x in names if x)
-    return str(n or "")
+    return str(n or "") if isinstance(n, (str, int)) else ""
 
 
 def iter_records(db_dir: pathlib.Path):
@@ -377,7 +384,7 @@ const list=document.getElementById('list'),main=document.getElementById('main'),
 document.getElementById('meta').textContent=D.meta;
 let cur=null;
 const esc=s=>s.replace(/[&<>]/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[x]));
-function match(f){return D.convs.filter(c=>!f||c.name.toLowerCase().includes(f)
+function match(f){return D.convs.filter(c=>!f||c.name.toLowerCase().includes(f)||c.id.toLowerCase().includes(f)
   ||c.msgs.some(m=>m.c.toLowerCase().includes(f)||m.s.toLowerCase().includes(f)))}
 function draw(){
   const f=q.value.trim().toLowerCase(),hits=match(f);
@@ -388,6 +395,7 @@ function draw(){
     const s=document.createElement('small');
     s.textContent=c.msgs.length+' msgs · '+(c.last||'').slice(0,10);
     d.append(s);
+    d.title=c.id;
     d.onclick=()=>{cur=c;draw();};
     if(c===cur)d.className='on';
     list.append(d);
@@ -416,6 +424,23 @@ q.oninput=draw;draw();
 """
 
 
+def label(cid: str, msgs: list, me: str) -> str:
+    """Teams doesn't always cache a title, but the participants are right there
+    in the messages. 'Alice, Bob (chat)' beats a raw thread GUID every time."""
+    if not cid:
+        return "(no conversation id)"
+    if cid.startswith("48:"):
+        return cid[3:].capitalize()          # 48:drafts, 48:mentions, ...
+    seen = list(dict.fromkeys(m["sender"] for m in msgs if m["sender"] not in ("", "?")))
+    others = [s for s in seen if s != me] or seen
+    if not others:
+        return cid
+    kind = ("meeting" if "meeting_" in cid else
+            "chat" if "unq.gbl.spaces" in cid else "channel")
+    extra = f" +{len(others) - 3}" if len(others) > 3 else ""
+    return f"{', '.join(others[:3])}{extra} ({kind})"
+
+
 def cmd_render(args) -> pathlib.Path:
     src = pathlib.Path(args.source)
     rows = [json.loads(l) for l in src.read_text(encoding="utf-8").splitlines() if l.strip()]
@@ -425,11 +450,20 @@ def cmd_render(args) -> pathlib.Path:
     by_conv: dict[str, list] = {}
     for r in rows:
         by_conv.setdefault(r["conv"], []).append(r)
+    # whoever posts across the most conversations is you -- drop yourself from
+    # participant-derived labels, otherwise every 1:1 reads "You, Alice"
+    seen_in: dict[str, set] = {}
+    for cid, msgs in by_conv.items():
+        for m in msgs:
+            seen_in.setdefault(m["sender"], set()).add(cid)
+    me = max(seen_in, key=lambda s: len(seen_in[s]), default="")
+
     convs = []
     for cid, msgs in by_conv.items():
         msgs.sort(key=lambda m: (m["ts"], m["id"]))
         convs.append({
-            "name": names.get(cid) or cid or "(unknown)",
+            "name": names.get(cid) or label(cid, msgs, me),
+            "id": cid,
             "last": msgs[-1]["ts"],
             "msgs": [{"s": m["sender"], "d": m["ts"][:19].replace("T", " "),
                       "t": m["type"], "c": clean(m["content"])} for m in msgs],
@@ -503,8 +537,20 @@ def cmd_selftest(_args) -> None:
     m2, c2 = [], []
     walk([conv], m2, c2)
     assert c2 == [conv] and conv_name(conv) == "PM guild"
-    assert conv_name({"id": "1", "type": "Chat", "title": "",
+    assert conv_name({"id": "19:1", "type": "Chat", "title": "",
                       "members": [{"displayName": "Bo"}, {"displayName": "Cy"}]}) == "Bo, Cy"
+    nested = {"id": "19:x@thread.tacv2", "threadProperties": {"topic": "PM guild"}}
+    assert looks_like_conversation(nested) and conv_name(nested) == "PM guild"
+    assert not looks_like_conversation({"id": "abc", "title": "not a teams id"})
+
+    chat = [{"sender": "Me"}, {"sender": "Alice"}]
+    assert label("48:drafts", [], "") == "Drafts"
+    assert label("", [], "") == "(no conversation id)"
+    assert label("19:x_y@unq.gbl.spaces", chat, "Me") == "Alice (chat)"
+    assert label("19:meeting_abc@thread.v2", chat, "Me") == "Alice (meeting)"
+    assert label("19:abc@thread.tacv2", [{"sender": s} for s in "ABCDE"], "A") \
+        == "B, C, D +1 (channel)"
+    assert label("19:solo@unq.gbl.spaces", [{"sender": "Me"}], "Me") == "Me (chat)"
 
     # a snapshot of a running Teams is always partial -- extract must survive it
     try:

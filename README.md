@@ -112,6 +112,20 @@ That's deliberately loose. It picks up drafts and system events alongside real
 messages; the HTML greys out `ThreadActivity/*` system noise rather than hiding
 it.
 
+### Conversation names
+
+A real title (channel topic, group chat name) is used when one is cached —
+including when it's nested in `threadProperties` rather than sitting at the top
+level of the record, which is the common case.
+
+Teams often hasn't cached one at all, though, and a sidebar full of
+`19:...@thread.tacv2` is useless. So the fallback derives a name from the people
+in the conversation, which is data we already have: **Alice Smith (chat)**,
+**Bob Jones, Cara Diaz, Dan Fox +2 (channel)**. Whoever appears across the most
+conversations is assumed to be you and dropped from the label, so 1:1 chats read
+as the other person rather than "You, Alice". The raw thread id is still there as
+the row's tooltip, and the filter box matches on it.
+
 ## The HTML
 
 Single self-contained file. Conversation sidebar, live filter across senders and
@@ -129,18 +143,21 @@ auth-gated URLs that won't load outside Teams anyway).
 
 | | |
 |---|---|
-| `collect` | written, exits cleanly when no Teams is present; **not yet run against a real Teams install** |
-| `extract` | written; survives a corrupt/partial LevelDB without aborting (a snapshot of a *running* Teams always is one). **Untested against a real Teams LevelDB** — the part most likely to need tweaking |
-| `render` | working, verified end to end on synthetic data |
+| `collect` | **working against a real Teams install**; skips locked files, limits itself to the Teams origin |
+| `extract` | **working** — pulls thousands of messages off a live install. Survives a corrupt/partial LevelDB and skips unreadable records rather than aborting |
+| `render` | working, verified end to end on real and synthetic data |
 | `watch` | written, untested |
 | GUI | builds and launches; buttons wired to the same functions the CLI uses |
 | exes | both build clean and run — `teamsexport.exe selftest` passes, GUI window renders |
 | `selftest` | `python teamsexport.py selftest` (or `teamsexport.exe selftest`) — asserts on the sanitizer, the duck-typed record walker, timestamp parsing, and that `extract` degrades gracefully on a garbage database |
 
-Next thing to do is run `collect` + `extract` on a machine that actually has
-Teams and see what the object stores really look like. Expect the duck-typing
-heuristics in `looks_like_message` / `looks_like_conversation` to need
-adjustment, and the conversation-name map to be incomplete.
+Known rough edges, in order of how much they'd bother you:
+
+- A large `(no conversation id)` bucket — messages whose records carry no
+  `conversationId` and no `conversationLink`. They're readable but unsorted.
+- Real channel titles resolve only when Teams has cached them; everything else
+  falls back to participant names.
+- Attachment/card messages render as their text plus an `[image]` placeholder.
 
 ## Not doing
 
