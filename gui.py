@@ -60,8 +60,9 @@ class App:
         self.btn_export = ttk.Button(bar, text="Export now", command=self.export)
         self.btn_zip = ttk.Button(bar, text="Parse a snapshot zip...", command=self.parse_zip)
         self.btn_open = ttk.Button(bar, text="Open export", command=self.open_html)
+        self.btn_probe = ttk.Button(bar, text="Probe", command=self.probe)
         self.btn_watch = ttk.Button(bar, text="Start watch", command=self.toggle_watch)
-        for b in (self.btn_export, self.btn_zip, self.btn_open, self.btn_watch):
+        for b in (self.btn_export, self.btn_zip, self.btn_open, self.btn_probe, self.btn_watch):
             b.pack(side="left", padx=(0, 6), pady=6)
         ttk.Label(bar, text="every").pack(side="left", padx=(12, 4))
         self.interval = tk.StringVar(value="15")
@@ -138,6 +139,16 @@ class App:
             tx.cmd_render(argparse.Namespace(source=store, out=out))
 
         self.run(job)
+
+    def probe(self) -> None:
+        """Schema report on the newest snapshot -- key names and counts, no
+        message text, so the log is safe to paste."""
+        snaps = sorted(pathlib.Path(self.paths()[0]).glob("snap-*.zip"))
+        if not snaps:
+            print("No snapshots yet -- run Export now first.\n")
+            return
+        print(f"probing {snaps[-1].name} (schema only, no message text)")
+        self.run(lambda: tx.cmd_probe(argparse.Namespace(source=str(snaps[-1]))))
 
     def open_html(self) -> None:
         html = self.paths()[2]

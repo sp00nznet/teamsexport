@@ -12,6 +12,7 @@ that and prints it nicely.
 python teamsexport.py collect                 # on the Teams machine -> snapshot zip
 python teamsexport.py extract snap.zip        # -> messages.jsonl (merges into existing)
 python teamsexport.py render                  # -> teams-export.html
+python teamsexport.py probe snap.zip          # what's in there: schema only, no message text
 python teamsexport.py watch --interval 900    # all three, on a loop
 ```
 
@@ -22,8 +23,8 @@ to install on the target machine:
 
 | | |
 |---|---|
-| `teamsexport.exe` | console; same four subcommands as above |
-| `teamsexport-gui.exe` | windowed; **Export now**, **Parse a snapshot zip...**, **Open export**, and a **watch** toggle with an interval, over a log pane |
+| `teamsexport.exe` | console; same subcommands as above |
+| `teamsexport-gui.exe` | windowed; **Export now**, **Parse a snapshot zip...**, **Open export**, **Probe**, and a **watch** toggle with an interval, over a log pane |
 
 The GUI defaults to `%USERPROFILE%\TeamsExport` for its snapshots, `messages.jsonl`
 and `teams-export.html`; change it in the box at the top. Everything runs on a
@@ -146,6 +147,7 @@ auth-gated URLs that won't load outside Teams anyway).
 | `collect` | **working against a real Teams install**; skips locked files, limits itself to the Teams origin |
 | `extract` | **working** — pulls thousands of messages off a live install. Survives a corrupt/partial LevelDB and skips unreadable records rather than aborting |
 | `render` | working, verified end to end on real and synthetic data |
+| `probe` | working — schema report (store names, field names, message types, record-key patterns) with no message text in the output, so it's safe to paste |
 | `watch` | written, untested |
 | GUI | builds and launches; buttons wired to the same functions the CLI uses |
 | exes | both build clean and run — `teamsexport.exe selftest` passes, GUI window renders |
@@ -153,8 +155,10 @@ auth-gated URLs that won't load outside Teams anyway).
 
 Known rough edges, in order of how much they'd bother you:
 
-- A large `(no conversation id)` bucket — messages whose records carry no
-  `conversationId` and no `conversationLink`. They're readable but unsorted.
+- The `(no conversation id)` bucket — messages whose records carry no
+  `conversationId` and no `conversationLink`. Most of these are now placed by
+  falling back to the IndexedDB *record key*, which is frequently the thread id
+  itself; `probe` reports on whatever is left.
 - Real channel titles resolve only when Teams has cached them; everything else
   falls back to participant names.
 - Attachment/card messages render as their text plus an `[image]` placeholder.

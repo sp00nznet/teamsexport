@@ -7,6 +7,7 @@ no Graph app registration.
 
   collect   copy the LevelDB store to a zip   (stdlib only -- run on the Teams box)
   extract   zip/dir -> messages.jsonl         (needs ccl_chromium_reader)
+  probe     what's in a snapshot: schema only, no message text
   render    messages.jsonl -> export.html
   watch     collect+extract+render on a loop, merging into one growing store
   selftest  asserts
@@ -14,12 +15,14 @@ no Graph app registration.
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime as dt
 import html
 import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import sys
 import tempfile
@@ -207,9 +210,8 @@ def iter_records(db_dir: pathlib.Path):
             continue
         for store_name in stores:
             try:
-                store = db[store_name]
-                for rec in store.iterate_records(bad_deserializer_data_handler=lambda k, v: None):
-                    yield rec.value
+                yield from db[store_name].iterate_records(
+                    bad_deserializer_data_handler=lambda k, v: None)
             except Exception as e:
                 print(f"  ! {db_id.name}/{store_name}: {e!r}", file=sys.stderr)
 
@@ -221,8 +223,18 @@ def load_store(path: pathlib.Path) -> dict:
         return {json.loads(l)["key"]: json.loads(l) for l in f if l.strip()}
 
 
-def cmd_extract(args) -> pathlib.Path:
-    src = pathlib.Path(args.source)
+ID_RE = re.compile(r"(?:19|48):[^\s\"'|,}\])]+")
+
+
+def id_in(s: str) -> str:
+    """Pull a Teams thread id out of a string. IndexedDB record keys are often
+    the conversation id, which is where messages with no conversationId hide."""
+    m = ID_RE.search(s)
+    return m.group(0) if m else ""
+
+
+def source_dbs(source: str) -> tuple[list[pathlib.Path], str | None]:
+    src = pathlib.Path(source)
     tmp = None
     if src.is_file() and src.suffix == ".zip":
         tmp = tempfile.mkdtemp(prefix="teamsexport-")
@@ -232,8 +244,12 @@ def cmd_extract(args) -> pathlib.Path:
     dbs = [src] if (src / "CURRENT").exists() else [
         p for p in src.rglob("*") if p.is_dir() and (p / "CURRENT").exists()]
     if not dbs:
-        sys.exit(f"No LevelDB store under {args.source}")
+        sys.exit(f"No LevelDB store under {source}")
+    return dbs, tmp
 
+
+def cmd_extract(args) -> pathlib.Path:
+    dbs, tmp = source_dbs(args.source)
     out = pathlib.Path(args.out)
     store = load_store(out)          # merge: Teams evicts old cache, we keep it
     names: dict[str, str] = {}
@@ -241,11 +257,11 @@ def cmd_extract(args) -> pathlib.Path:
     bad = 0
     for db in dbs:
         print(f"reading {db}", file=sys.stderr)
-        for value in iter_records(db):
+        for rec in iter_records(db):
             try:
                 msgs: list = []
                 convs: list = []
-                walk(value, msgs, convs)
+                walk(rec.value, msgs, convs)
                 for c in convs:
                     cid, n = str(get(c, "id", default="")), conv_name(c)
                     if cid and len(n) > len(names.get(cid, "")):
@@ -254,6 +270,8 @@ def cmd_extract(args) -> pathlib.Path:
                     r = normalize(m)
                     if not r:
                         continue
+                    if not r["conv"]:  # last resort: the record key is often the thread
+                        r["conv"] = id_in(str(rec.key))
                     r["key"] = f"{r['conv']}|{r['id'] or r['ts']}|{hash(r['content']) & 0xffffffff}"
                     store.setdefault(r["key"], r)
             except Exception as e:  # one odd record must not cost you the export
@@ -274,6 +292,61 @@ def cmd_extract(args) -> pathlib.Path:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"{out}: {len(store)} messages (+{len(store) - before} new), {len(known)} conversations")
     return out
+
+
+# ---------------------------------------------------------------- probe
+
+def keypat(k) -> str:
+    """Record key with digit runs collapsed, so thousands of keys become a few
+    patterns -- and any number in them is redacted on the way."""
+    return re.sub(r"\d+", "#", str(k))[:80]
+
+
+def top(c: collections.Counter, n: int, indent: str = "  ") -> str:
+    return "".join(f"{indent}{v:>6} x  {k}\n" for k, v in c.most_common(n)) or f"{indent}(none)\n"
+
+
+def cmd_probe(args) -> None:
+    """What's actually in the database: store names, key names, message types,
+    record-key shapes. Never message text, so the output is safe to paste."""
+    dbs, _ = source_dbs(args.source)
+    stores, orphan_stores = collections.Counter(), collections.Counter()
+    sigs, types, pats = collections.Counter(), collections.Counter(), collections.Counter()
+    total = shaped = orphans = 0
+    for db in dbs:
+        for rec in iter_records(db):
+            total += 1
+            where = f"{rec.database_name}/{rec.object_store_name}"
+            stores[where] += 1
+            msgs: list = []
+            try:
+                walk(rec.value, msgs, [])
+            except Exception:
+                continue
+            for m in msgs:
+                shaped += 1
+                r = normalize(m)
+                if not r or r["conv"] or id_in(str(rec.key)):
+                    continue                      # already placed in a conversation
+                orphans += 1
+                orphan_stores[where] += 1
+                sigs[", ".join(sorted(keys(m)))] += 1
+                types[str(get(m, "messagetype", default="(none)"))] += 1
+                pats[keypat(rec.key)] += 1
+
+    print(f"\n{total} records, {shaped} message-shaped, {orphans} with no conversation id\n")
+    print("stores:")
+    print(top(stores, 15), end="")
+    if not orphans:
+        return
+    print("\n--- the orphan bucket ---\n\nwhich store they came from:")
+    print(top(orphan_stores, 10), end="")
+    print("\ntheir message types:")
+    print(top(types, 10), end="")
+    print("\ntheir record-key patterns (digits replaced with #):")
+    print(top(pats, 10), end="")
+    print("\ntheir field names:")
+    print(top(sigs, 6), end="")
 
 
 # ---------------------------------------------------------------- rendering
@@ -552,6 +625,11 @@ def cmd_selftest(_args) -> None:
         == "B, C, D +1 (channel)"
     assert label("19:solo@unq.gbl.spaces", [{"sender": "Me"}], "Me") == "Me (chat)"
 
+    assert id_in("IdbKey(value='19:abc@thread.tacv2')") == "19:abc@thread.tacv2"
+    assert id_in("48:notifications") == "48:notifications"
+    assert id_in("1700000000000") == ""
+    assert keypat("conv-000123-x") == "conv-#-x"
+
     # a snapshot of a running Teams is always partial -- extract must survive it
     try:
         import ccl_chromium_reader  # noqa: F401
@@ -579,6 +657,10 @@ def main() -> None:
     e.add_argument("source")
     e.add_argument("-o", "--out", default="messages.jsonl")
     e.set_defaults(func=cmd_extract)
+
+    pr = sub.add_parser("probe", help="report what's in a snapshot: schema only, no message text")
+    pr.add_argument("source")
+    pr.set_defaults(func=cmd_probe)
 
     r = sub.add_parser("render", help="messages.jsonl -> html")
     r.add_argument("source", nargs="?", default="messages.jsonl")
