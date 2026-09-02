@@ -51,7 +51,11 @@ def discover() -> list[pathlib.Path]:
         if root:
             for pkg in pathlib.Path(root, "Packages").glob("*Teams*"):
                 hits += [p for p in pkg.rglob("*.indexeddb.leveldb") if p.is_dir()]
-    return sorted(set(hits))
+    hits = sorted(set(hits))
+    # Teams' WebView2 profile also holds SharePoint/OneDrive origins we have no
+    # business copying. Keep the teams.microsoft.com ones; fall back to all only
+    # if the origin gets renamed out from under us.
+    return [p for p in hits if "teams" in p.name.lower()] or hits
 
 
 def cmd_collect(args) -> pathlib.Path:
@@ -87,8 +91,13 @@ MSG_KEYS = {"content", "body"}
 TIME_KEYS = ("composetime", "originalarrivaltime", "createdtime", "version")
 
 
+def keys(d: dict) -> set[str]:
+    # V8 objects deserialize with non-string keys (ints, mostly), so str() first.
+    return {str(x).lower() for x in d}
+
+
 def looks_like_message(d: dict) -> bool:
-    k = {x.lower() for x in d}
+    k = keys(d)
     if not (k & MSG_KEYS):
         return False
     return "messagetype" in k or d.get("type") == "Message" or bool(
@@ -96,7 +105,7 @@ def looks_like_message(d: dict) -> bool:
 
 
 def looks_like_conversation(d: dict) -> bool:
-    k = {x.lower() for x in d}
+    k = keys(d)
     return "id" in k and bool(k & {"displayname", "title", "topic"}) and bool(
         k & {"threadproperties", "lastmessage", "members", "type"})
 
@@ -118,7 +127,7 @@ def walk(obj, out_msgs: list, out_convs: list, depth: int = 0) -> None:
 
 
 def get(d: dict, *names, default=None):
-    low = {k.lower(): v for k, v in d.items()}
+    low = {str(k).lower(): v for k, v in d.items()}
     for n in names:
         v = low.get(n.lower())
         if v not in (None, ""):
@@ -222,22 +231,30 @@ def cmd_extract(args) -> pathlib.Path:
     store = load_store(out)          # merge: Teams evicts old cache, we keep it
     names: dict[str, str] = {}
     before = len(store)
+    bad = 0
     for db in dbs:
         print(f"reading {db}", file=sys.stderr)
         for value in iter_records(db):
-            msgs: list = []
-            convs: list = []
-            walk(value, msgs, convs)
-            for c in convs:
-                cid, n = str(get(c, "id", default="")), conv_name(c)
-                if cid and len(n) > len(names.get(cid, "")):
-                    names[cid] = n
-            for m in msgs:
-                r = normalize(m)
-                if not r:
-                    continue
-                r["key"] = f"{r['conv']}|{r['id'] or r['ts']}|{hash(r['content']) & 0xffffffff}"
-                store.setdefault(r["key"], r)
+            try:
+                msgs: list = []
+                convs: list = []
+                walk(value, msgs, convs)
+                for c in convs:
+                    cid, n = str(get(c, "id", default="")), conv_name(c)
+                    if cid and len(n) > len(names.get(cid, "")):
+                        names[cid] = n
+                for m in msgs:
+                    r = normalize(m)
+                    if not r:
+                        continue
+                    r["key"] = f"{r['conv']}|{r['id'] or r['ts']}|{hash(r['content']) & 0xffffffff}"
+                    store.setdefault(r["key"], r)
+            except Exception as e:  # one odd record must not cost you the export
+                bad += 1
+                if bad == 1:
+                    print(f"  ! skipping unreadable record: {e!r}", file=sys.stderr)
+    if bad:
+        print(f"  ! {bad} record(s) skipped", file=sys.stderr)
 
     meta_path = out.with_suffix(".convs.json")
     known = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
@@ -476,6 +493,11 @@ def cmd_selftest(_args) -> None:
     assert normalize({"messagetype": "x", "content": "  "}) is None
     assert normalize({"messagetype": "x", "content": "hi",
                       "conversationLink": "https://x/conversations/19:z"})["conv"] == "19:z"
+
+    weird = {0: "int key", "content": "hi", "messagetype": "Text"}   # V8 gives int keys
+    m3, c3 = [], []
+    walk({"a": weird}, m3, c3)
+    assert m3 == [weird] and normalize(weird)["content"] == "hi"
 
     conv = {"id": "19:abc@thread.v2", "type": "Space", "displayName": "PM guild"}
     m2, c2 = [], []
